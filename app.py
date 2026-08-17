@@ -1,28 +1,32 @@
-import streamlit as st
-import boto3
-import json
 import os
 import re
-from dotenv import load_dotenv
+import json
+import urllib.parse
 
-from diffusers import StableDiffusionPipeline
-import torch
+import boto3
+import requests
+import streamlit as st
+
+from dotenv import load_dotenv
 from gtts import gTTS
 
 
 # ============================================================
-# LOAD ENVIRONMENT VARIABLES
+# ENVIRONMENT
 # ============================================================
 
 load_dotenv()
 
-AWS_REGION = os.getenv("AWS_REGION")
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 
+# Optional Pollinations API key
+POLLINATIONS_API_KEY = os.getenv("POLLINATIONS_API_KEY")
+
 
 # ============================================================
-# AWS BEDROCK CLIENT
+# AWS CLIENT
 # ============================================================
 
 bedrock = boto3.client(
@@ -34,7 +38,7 @@ bedrock = boto3.client(
 
 
 # ============================================================
-# STREAMLIT PAGE CONFIGURATION
+# PAGE
 # ============================================================
 
 st.set_page_config(
@@ -44,7 +48,9 @@ st.set_page_config(
 )
 
 st.title("📚 AI Story Generator")
-st.caption("Detailed Story + Meaningful AI Illustrations + Narration")
+st.caption(
+    "Detailed Story + AI Illustrations + Narration"
+)
 
 
 # ============================================================
@@ -56,7 +62,7 @@ topic = st.text_input(
     placeholder="Example: A boy travels through space"
 )
 
-style = st.selectbox(
+image_style = st.selectbox(
     "Choose Image Style",
     [
         "Watercolor",
@@ -77,50 +83,12 @@ language = st.selectbox(
 
 
 # ============================================================
-# LOAD LOCAL STABLE DIFFUSION MODEL
+# AWS NOVA
 # ============================================================
 
-@st.cache_resource
-def load_model():
+def ask_nova(prompt, tokens=1500, temperature=0.7):
 
-    if not torch.cuda.is_available():
-        st.error(
-            "CUDA GPU is not available. "
-            "Please check your NVIDIA GPU and PyTorch installation."
-        )
-        st.stop()
-
-    # Existing local model downloaded on this computer.
-    # local_files_only=True prevents Hugging Face 429/download errors.
-    model_path = (
-        r"D:\hf_cache\hub\models--runwayml--stable-diffusion-v1-5"
-        r"\snapshots\451f4fe16113bff5a5d2269ed5ad43b0592e9a14"
-    )
-
-    pipe = StableDiffusionPipeline.from_pretrained(
-        model_path,
-        torch_dtype=torch.float16,
-        local_files_only=True
-    )
-
-    # Optimizations for RTX 3050 4 GB
-    pipe.enable_attention_slicing()
-    pipe.enable_vae_slicing()
-    pipe.enable_model_cpu_offload()
-
-    return pipe
-
-
-pipe = load_model()
-
-
-# ============================================================
-# BEDROCK FUNCTION
-# ============================================================
-
-def ask_bedrock(prompt, tokens=1500, temperature=0.8):
-
-    body = json.dumps({
+    body = {
         "messages": [
             {
                 "role": "user",
@@ -135,16 +103,18 @@ def ask_bedrock(prompt, tokens=1500, temperature=0.8):
             "max_new_tokens": tokens,
             "temperature": temperature
         }
-    })
+    }
 
     response = bedrock.invoke_model(
         modelId="amazon.nova-lite-v1:0",
-        body=body,
+        body=json.dumps(body),
         contentType="application/json",
         accept="application/json"
     )
 
-    result = json.loads(response["body"].read())
+    result = json.loads(
+        response["body"].read()
+    )
 
     return result["output"]["message"]["content"][0]["text"]
 
@@ -156,45 +126,36 @@ def ask_bedrock(prompt, tokens=1500, temperature=0.8):
 def generate_story(topic):
 
     prompt = f"""
-Create a detailed, original and emotionally engaging story
-based on this topic:
+Write a detailed and creative story about:
 
 {topic}
 
-STORY REQUIREMENTS:
+Requirements:
 
-1. Do NOT force the story into exactly 5 scenes.
-2. Generate 6 to 10 meaningful paragraphs/modules,
-   depending on how naturally the story develops.
-3. Each paragraph must represent ONE important visual
-   story moment that can be illustrated as a single image.
-4. Do not put several major actions into one paragraph.
-5. Each paragraph should have:
-   - one main action
-   - one clear setting
-   - one emotional moment
-   - only a few important objects
-6. Include:
+1. Write 7 to 10 natural paragraphs.
+2. Do NOT number the paragraphs.
+3. Do NOT use Scene 1, Scene 2, etc.
+4. Each paragraph should continue the previous paragraph.
+5. The story must have:
    - introduction
    - character development
-   - journey
-   - challenge/conflict
+   - exploration
+   - conflict
    - rising action
    - climax
    - resolution
-   - meaningful ending
-7. Make the story detailed, emotional and cinematic.
-8. Maintain consistency in character names, appearance,
-   locations and important objects.
-9. Use normal paragraphs only.
-10. Do NOT use scene numbers.
-11. Do NOT use module headings.
-12. Do NOT use bullet points.
-13. Do NOT add explanations.
-14. Return ONLY the complete story.
+   - emotional ending
+6. Use vivid descriptions.
+7. Make the story suitable for a storybook.
+8. Keep the same main characters throughout the story.
+9. Make every paragraph visually meaningful so it can later
+   be converted into an illustration.
+10. Do not add explanations before or after the story.
+
+Return ONLY the story.
 """
 
-    return ask_bedrock(
+    return ask_nova(
         prompt,
         tokens=2200,
         temperature=0.8
@@ -202,274 +163,183 @@ STORY REQUIREMENTS:
 
 
 # ============================================================
+# SPLIT STORY INTO MODULES
+# ============================================================
+
+def split_modules(story):
+
+    paragraphs = re.split(
+        r"\n\s*\n",
+        story.strip()
+    )
+
+    paragraphs = [
+        p.strip()
+        for p in paragraphs
+        if len(p.strip()) > 40
+    ]
+
+    return paragraphs
+
+
+# ============================================================
 # CHARACTER BIBLE
-# Creates a stable visual description for recurring characters.
 # ============================================================
 
 def create_character_bible(story):
 
     prompt = f"""
-You are a professional children's storybook character designer.
+Analyze this story and create a short visual character bible.
 
-Read the story below and create a CONSISTENT visual character
-description for the main recurring character(s).
-
-STORY:
+Story:
 {story}
 
-For each important recurring character, describe:
-- name
-- approximate age
-- gender if clearly established
-- hair
-- eyes
-- face
-- clothing
-- shoes
-- important accessories
-- distinctive visual features
+For every important recurring character provide:
 
-Rules:
-- Keep descriptions realistic and human unless the story
-  explicitly requires a non-human character.
-- Do not invent unnecessary characters.
-- Do not change the character's appearance between paragraphs.
-- Keep the descriptions concise.
-- Return only the character descriptions.
+Name:
+Age:
+Gender:
+Hair:
+Clothing:
+Body type:
+Important visual features:
+
+Keep the descriptions simple and consistent.
+
+Return only the character descriptions.
 """
 
-    return ask_bedrock(
+    return ask_nova(
         prompt,
-        tokens=450,
-        temperature=0.2
+        tokens=800,
+        temperature=0.3
     )
 
 
 # ============================================================
-# SPLIT STORY INTO VISUAL MODULES
-# ============================================================
-
-def split_modules(story):
-
-    # Remove accidental markdown heading markers.
-    story = re.sub(r"^\s*#+\s*", "", story, flags=re.MULTILINE)
-
-    # First try paragraph separation.
-    modules = [
-        p.strip()
-        for p in re.split(r"\n\s*\n+", story)
-        if p.strip()
-    ]
-
-    # Fallback if the model returned one-line paragraphs.
-    if len(modules) < 2:
-        modules = [
-            p.strip()
-            for p in story.split("\n")
-            if p.strip()
-        ]
-
-    # Keep each module as one meaningful story unit.
-    return modules
-
-
-# ============================================================
 # VISUAL SCENE PLANNER
-# Converts a story paragraph into a concrete image blueprint.
 # ============================================================
 
-def create_visual_prompt(module_text, character_bible, style):
+def create_visual_prompt(
+    paragraph,
+    character_bible,
+    style
+):
 
     prompt = f"""
-You are a professional children's storybook illustrator
-and visual scene composition expert.
+You are a professional children's storybook illustrator.
 
-Convert ONE story paragraph into ONE clear visual scene
-for an image-generation model.
+Create ONE highly detailed image prompt from the paragraph below.
 
 CHARACTER BIBLE:
 {character_bible}
 
 STORY PARAGRAPH:
-{module_text}
+{paragraph}
 
-REQUESTED ART STYLE:
+ART STYLE:
 {style}
 
-Create a precise visual blueprint.
+The image must be a meaningful illustration.
 
-Include:
-1. Main subject and appearance.
-2. Exactly what the main character is doing.
-3. Facial expression/emotion.
-4. Setting and time of day.
-5. Important objects that MUST appear.
-6. Foreground.
-7. Middle ground.
-8. Background.
-9. Spatial arrangement and relative positions.
-10. Camera/view composition.
+Describe:
 
-IMPORTANT RULES:
-- Show ONE main moment only.
-- Do not combine several events from the paragraph.
-- Do not invent unrelated objects.
-- Keep the recurring character's appearance identical
-  to the character bible.
-- Keep people anatomically natural.
-- Clearly separate people and objects.
-- Describe physical relationships between objects.
-- Avoid surreal or abstract interpretations.
-- Prefer a simple readable composition over a crowded image.
-- The image should look like a traditional children's
-  storybook illustration.
-- Do not include text, letters, titles, captions or logos.
+- main character
+- exact action
+- facial expression
+- emotion
+- environment
+- important objects
+- foreground
+- middle ground
+- background
+- lighting
+- camera/viewpoint
+- spatial relationships between objects
 
-Return ONLY a detailed visual description, approximately
-120-180 words.
+Important:
+
+The character must have normal human anatomy.
+
+Objects must have realistic relationships with each other.
+
+Do NOT create fantasy creatures unless the story explicitly requires them.
+
+Do NOT randomly add objects.
+
+Do NOT make the image photorealistic.
+
+The result should look like a carefully illustrated children's
+storybook painting.
+
+Return ONLY the image prompt.
 """
 
-    return ask_bedrock(
+    return ask_nova(
         prompt,
-        tokens=400,
-        temperature=0.25
-    )
-
-
-# ============================================================
-# CAPTION GENERATION
-# ============================================================
-
-def create_caption(module_text):
-
-    prompt = f"""
-Read this story paragraph:
-
-{module_text}
-
-Write exactly TWO short, beautiful sentences that can
-be displayed below an illustration.
-
-Requirements:
-- Capture the main action and emotion.
-- Do not mechanically summarize.
-- Simple but expressive language.
-- No numbering.
-- No quotation marks.
-- Return only the two sentences.
-"""
-
-    return ask_bedrock(
-        prompt,
-        tokens=150,
+        tokens=900,
         temperature=0.5
     )
 
 
 # ============================================================
-# IMAGE STYLE PROMPTS
+# STYLE
 # ============================================================
 
-def get_style_prompt(style):
+def get_style(style):
 
-    if style == "Watercolor":
-        return """
-traditional children's book watercolor painting,
-hand-painted watercolor on textured paper,
-soft natural brush strokes,
-gentle color blending,
-delicate ink outlines,
-subtle paper texture,
-warm artistic atmosphere,
-clear readable composition,
-beautiful traditional storybook artwork
-"""
+    styles = {
 
-    elif style == "Sketch":
-        return """
-traditional pencil and ink children's book drawing,
-hand-drawn graphite line art,
-fine pencil shading,
-natural human proportions,
-delicate ink outlines,
-paper texture,
-clean readable composition,
-traditional illustration
-"""
+        "Watercolor":
+        """
+        traditional watercolor children's book illustration,
+        hand-painted paper texture,
+        soft watercolor washes,
+        delicate ink outlines,
+        natural human anatomy,
+        expressive faces,
+        harmonious pastel colors,
+        carefully composed illustration
+        """,
 
-    elif style == "Cartoon":
-        return """
-hand-drawn 2D children's cartoon illustration,
-clean expressive linework,
-soft painted colors,
-natural character proportions,
-expressive but believable faces,
-clear readable composition,
-traditional storybook cartoon artwork
-"""
+        "Sketch":
+        """
+        hand-drawn pencil and ink children's book illustration,
+        graphite lines,
+        subtle shading,
+        paper texture,
+        clean anatomy,
+        expressive characters,
+        carefully composed drawing
+        """,
 
-    return """
-traditional children's storybook illustration,
-hand-painted artwork on paper,
-soft ink outlines,
-gentle colors,
-subtle paper texture,
-natural character proportions,
-clear visual storytelling,
-beautiful children's book artwork
-"""
+        "Cartoon":
+        """
+        high-quality children's cartoon illustration,
+        clean hand-drawn outlines,
+        expressive faces,
+        natural anatomy,
+        soft colors,
+        storybook composition,
+        polished 2D illustration
+        """,
 
+        "Storybook":
+        """
+        classic children's storybook illustration,
+        hand-painted appearance,
+        watercolor and ink,
+        soft paper texture,
+        expressive characters,
+        beautiful composition,
+        warm artistic atmosphere
+        """
+    }
 
-# ============================================================
-# NEGATIVE PROMPT
-# Prevents common SD 1.5 image problems.
-# ============================================================
-
-NEGATIVE_PROMPT = """
-photorealistic,
-3d render,
-cgi,
-surreal,
-abstract,
-fantasy mutation,
-unreal species,
-deformed human,
-distorted anatomy,
-extra arms,
-extra legs,
-extra hands,
-extra fingers,
-missing fingers,
-fused fingers,
-duplicate person,
-duplicate character,
-duplicate object,
-merged objects,
-floating objects,
-detached body parts,
-twisted body,
-bad proportions,
-deformed face,
-asymmetrical eyes,
-bad hands,
-malformed hands,
-cluttered composition,
-random objects,
-unrelated objects,
-confusing scene,
-multiple simultaneous events,
-extreme close-up,
-cropped character,
-blurry,
-low quality,
-text,
-letters,
-words,
-title,
-caption,
-logo,
-watermark
-"""
+    return styles.get(
+        style,
+        styles["Watercolor"]
+    )
 
 
 # ============================================================
@@ -477,85 +347,171 @@ watermark
 # ============================================================
 
 def generate_image(
-    module_text,
-    character_bible,
+    visual_prompt,
     style
 ):
 
-    # First let Nova understand the story visually.
-    visual_description = create_visual_prompt(
-        module_text,
-        character_bible,
-        style
-    )
+    style_description = get_style(style)
 
-    style_description = get_style_prompt(style)
-
-    # Stable Diffusion receives a visual blueprint,
-    # not the original story paragraph.
-    image_prompt = f"""
-{style_description}
-
-CHARACTER CONSISTENCY:
-{character_bible}
-
-VISUAL SCENE:
-{visual_description}
-
-COMPOSITION REQUIREMENTS:
-- One clear story moment.
-- Main character is clearly visible.
-- Natural human anatomy.
-- Objects have correct physical relationships.
-- Foreground, middle ground and background are distinct.
-- Balanced composition.
-- The main action is visually obvious.
-- Traditional painted/drawn appearance.
-- No text or writing anywhere in the image.
+    negative_prompt = """
+photorealistic,
+3d render,
+uncanny,
+deformed human,
+extra arms,
+extra legs,
+extra fingers,
+missing fingers,
+duplicate character,
+multiple heads,
+merged bodies,
+floating objects,
+random objects,
+distorted face,
+bad anatomy,
+mutated hands,
+disconnected limbs,
+unreal species,
+alien anatomy,
+blurry,
+low quality,
+text,
+letters,
+watermark
 """
 
-    image = pipe(
-        prompt=image_prompt,
-        negative_prompt=NEGATIVE_PROMPT,
-        height=512,
-        width=512,
-        num_inference_steps=25,
-        guidance_scale=6.5
-    ).images[0]
+    final_prompt = f"""
+{style_description}
 
-    return image
+{visual_prompt}
+
+IMPORTANT:
+Create one coherent illustration.
+Keep every character anatomically normal.
+Place objects according to the described foreground,
+middle ground and background.
+Make the scene look intentionally painted by a human
+storybook artist.
+"""
+
+    encoded_prompt = urllib.parse.quote(
+        final_prompt
+    )
+
+    url = (
+        "https://gen.pollinations.ai/image/"
+        + encoded_prompt
+        + "?model=flux"
+        + "&width=768"
+        + "&height=512"
+        + "&nologo=true"
+    )
+
+    headers = {}
+
+    if POLLINATIONS_API_KEY:
+        headers["Authorization"] = (
+            f"Bearer {POLLINATIONS_API_KEY}"
+        )
+
+    response = requests.get(
+        url,
+        headers=headers,
+        timeout=180
+    )
+
+    if response.status_code != 200:
+
+        raise Exception(
+            f"Image API failed: "
+            f"{response.status_code} "
+            f"{response.text[:300]}"
+        )
+
+    return response.content
 
 
 # ============================================================
-# LANGUAGE CODE FOR gTTS
+# CAPTION
 # ============================================================
 
-def get_language_code(language):
+def create_caption(paragraph):
 
-    if language == "Tamil":
-        return "ta"
+    prompt = f"""
+Create two short beautiful lines that summarize this
+story paragraph as a visual caption.
 
-    if language == "Hindi":
-        return "hi"
+Paragraph:
+{paragraph}
 
-    return "en"
+Rules:
+
+- Exactly 2 lines.
+- Emotional.
+- Simple.
+- Storybook style.
+- Do not number the lines.
+"""
+
+    return ask_nova(
+        prompt,
+        tokens=150,
+        temperature=0.5
+    )
 
 
 # ============================================================
-# NARRATION
+# TRANSLATE FOR NARRATION
+# ============================================================
+
+def translate_story(story, language):
+
+    if language == "English":
+        return story
+
+    prompt = f"""
+Translate the following story into {language}.
+
+Preserve:
+- meaning
+- emotions
+- character names
+- paragraph structure
+
+Return only the translated story.
+
+Story:
+{story}
+"""
+
+    return ask_nova(
+        prompt,
+        tokens=2500,
+        temperature=0.3
+    )
+
+
+# ============================================================
+# AUDIO
 # ============================================================
 
 def generate_audio(text, language):
 
-    language_code = get_language_code(language)
+    language_codes = {
+        "English": "en",
+        "Tamil": "ta",
+        "Hindi": "hi"
+    }
 
-    audio_file = "story_narration.mp3"
+    code = language_codes[language]
 
     tts = gTTS(
         text=text[:5000],
-        lang=language_code,
+        lang=code,
         slow=False
     )
+
+    audio_file = "story_narration.mp3"
 
     tts.save(audio_file)
 
@@ -563,7 +519,7 @@ def generate_audio(text, language):
 
 
 # ============================================================
-# MAIN APPLICATION
+# MAIN
 # ============================================================
 
 if st.button(
@@ -572,43 +528,64 @@ if st.button(
 ):
 
     if not topic.strip():
-        st.warning("Please enter a story topic.")
+
+        st.warning(
+            "Please enter a story topic."
+        )
+
         st.stop()
+
 
     # --------------------------------------------------------
     # STORY
     # --------------------------------------------------------
 
-    with st.spinner("📖 Creating your detailed story..."):
+    with st.spinner(
+        "✍️ Creating your story..."
+    ):
 
         try:
+
             story = generate_story(topic)
 
         except Exception as e:
-            st.error(f"Story generation failed:\n\n{e}")
+
+            st.error(
+                f"Story generation failed: {e}"
+            )
+
             st.stop()
 
+
     st.subheader("📖 Full Story")
+
     st.write(story)
+
 
     # --------------------------------------------------------
     # CHARACTER BIBLE
     # --------------------------------------------------------
 
-    with st.spinner("👤 Creating consistent character design..."):
+    with st.spinner(
+        "🎭 Understanding characters..."
+    ):
 
         try:
-            character_bible = create_character_bible(story)
 
-        except Exception as e:
-            character_bible = ""
-            st.warning(
-                f"Character design generation failed. "
-                f"Images will still be generated.\n\n{e}"
+            character_bible = (
+                create_character_bible(story)
             )
 
+        except Exception:
+
+            character_bible = (
+                "Use consistent characters "
+                "throughout the illustrations."
+            )
+
+
     # --------------------------------------------------------
-    # STORY MODULES
+    # MODULES
     # --------------------------------------------------------
 
     modules = split_modules(story)
@@ -617,8 +594,9 @@ if st.button(
         f"🎨 Story Modules ({len(modules)})"
     )
 
+
     # --------------------------------------------------------
-    # PROCESS EACH MODULE
+    # IMAGES
     # --------------------------------------------------------
 
     for index, module in enumerate(
@@ -627,23 +605,41 @@ if st.button(
     ):
 
         st.markdown(
-            f"## 📍 Module {index}"
+            f"## Module {index}"
         )
 
-        # ----------------------------------------------------
-        # IMAGE
-        # ----------------------------------------------------
-
+        # Visual planning
         with st.spinner(
-            f"🎨 Planning and painting Module {index}..."
+            f"🎨 Planning illustration {index}..."
+        ):
+
+            try:
+
+                visual_prompt = create_visual_prompt(
+                    module,
+                    character_bible,
+                    image_style
+                )
+
+            except Exception as e:
+
+                st.error(
+                    f"Visual planning failed: {e}"
+                )
+
+                visual_prompt = module
+
+
+        # Image
+        with st.spinner(
+            f"🖌️ Painting illustration {index}..."
         ):
 
             try:
 
                 image = generate_image(
-                    module,
-                    character_bible,
-                    style
+                    visual_prompt,
+                    image_style
                 )
 
                 st.image(
@@ -654,16 +650,13 @@ if st.button(
             except Exception as e:
 
                 st.error(
-                    f"Image generation failed for Module "
-                    f"{index}: {e}"
+                    f"Image generation failed: {e}"
                 )
 
-        # ----------------------------------------------------
-        # CAPTION
-        # ----------------------------------------------------
 
+        # Caption
         with st.spinner(
-            "✍️ Creating illustration caption..."
+            "✨ Creating caption..."
         ):
 
             try:
@@ -673,32 +666,29 @@ if st.button(
                 )
 
                 st.markdown(
-                    f"### ✨ {caption}"
+                    f"✨ {caption}"
                 )
 
-            except Exception as e:
+            except Exception:
 
-                st.warning(
-                    f"Caption generation failed: {e}"
-                )
+                pass
 
-        # ----------------------------------------------------
-        # FULL MODULE
-        # ----------------------------------------------------
 
+        # Paragraph
         with st.expander(
-            f"📖 Read Module {index}"
+            "📖 Read Full Paragraph"
         ):
 
             st.write(module)
 
-        st.markdown("---")
 
     # --------------------------------------------------------
     # NARRATION
     # --------------------------------------------------------
 
-    st.subheader("🔊 Narration")
+    st.subheader(
+        "🔊 Narration"
+    )
 
     with st.spinner(
         "🎙️ Creating narration..."
@@ -706,18 +696,19 @@ if st.button(
 
         try:
 
-            audio_file = generate_audio(
+            narration_text = translate_story(
                 story,
+                language
+            )
+
+            audio_file = generate_audio(
+                narration_text,
                 language
             )
 
             st.audio(
                 audio_file,
                 format="audio/mp3"
-            )
-
-            st.success(
-                "Narration generated successfully!"
             )
 
         except Exception as e:

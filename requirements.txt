@@ -1,0 +1,11 @@
+streamlit
+boto3
+python-dotenv
+torch
+torchvision
+diffusers
+transformers
+accelerate
+safetensors
+huggingface_hub
+gTTS

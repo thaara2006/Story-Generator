@@ -1,7 +1,6 @@
 streamlit
 boto3
 python-dotenv
-<<<<<<< HEAD
 torch
 torchvision
 diffusers
@@ -9,7 +8,4 @@ transformers
 accelerate
 safetensors
 huggingface_hub
-=======
-requests
->>>>>>> origin/main
 gTTS
